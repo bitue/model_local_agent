@@ -21,12 +21,31 @@ DEFAULT_DATASETS = ["wine", "breast_cancer"]
 def build_benchmark_prompt(algorithms=None, datasets=None) -> str:
     algorithms = algorithms or DEFAULT_ALGORITHMS
     datasets = datasets or DEFAULT_DATASETS
+
+    # Spell out the exact required calls as a checklist rather than leaving
+    # the (algorithm x dataset) cross-product for the model to derive itself
+    # turn by turn. The small 3B model was observed to re-derive ("I need to
+    # gather the dataset summaries first...") and re-run its own plan from
+    # scratch on every turn of an open-ended multi-dataset prompt instead of
+    # advancing through it -- an explicit checklist gives it a fixed list of
+    # remaining work items to check off instead of a plan to keep re-deriving.
+    call_list = "\n".join(
+        f'{i}. train_sklearn_model with Action Input: {{"dataset_name": "{ds}", "model_type": "{algo}"}}'
+        for i, (algo, ds) in enumerate(
+            ((algo, ds) for ds in datasets for algo in algorithms), start=1
+        )
+    )
+
     return (
         f"Autonomously evaluate these {len(algorithms)} algorithms: {', '.join(algorithms)} "
-        f"across these {len(datasets)} datasets: {', '.join(datasets)}. "
-        "For each (algorithm, dataset) pair, call the appropriate tool and record its test "
-        "accuracy, 5-fold cross-validation mean accuracy, and CV standard deviation. "
-        "After gathering all results, write your Final Answer as a Markdown table with columns: "
+        f"across these {len(datasets)} datasets: {', '.join(datasets)}.\n\n"
+        f"You must make exactly these {len(algorithms) * len(datasets)} train_sklearn_model calls, "
+        f"each one time, in any order (do not call load_dataset_summary -- it is not needed here, "
+        f"train_sklearn_model already reports everything you need):\n"
+        f"{call_list}\n\n"
+        "For each call, record its test accuracy, 5-fold cross-validation mean accuracy, and CV "
+        f"standard deviation from the Observation. Once you have all {len(algorithms) * len(datasets)} "
+        "results (and not before), write your Final Answer as a Markdown table with columns: "
         "Algorithm | Dataset | Test Accuracy | CV Mean Accuracy | CV Std, followed by 2-3 "
         "sentences recommending the best model per dataset and discussing the bias/variance "
         "trade-off you observed across the results."
@@ -36,8 +55,11 @@ def build_benchmark_prompt(algorithms=None, datasets=None) -> str:
 def main():
     prompt = build_benchmark_prompt()
     # 3 algorithms x 2 datasets = 6 tool calls minimum, plus the Final Answer
-    # step and headroom for self-correction retries.
-    result = run_agent_loop(prompt, max_iterations=12)
+    # step and headroom for self-correction retries -- the 3B model has been
+    # observed to need a couple of nudged retries per dataset before it
+    # stops re-fetching a summary it already has, so this budget covers 6
+    # real calls + up to ~3 wasted nudge turns per dataset + the final step.
+    result = run_agent_loop(prompt, max_iterations=16)
 
     os.makedirs(LOG_DIR, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

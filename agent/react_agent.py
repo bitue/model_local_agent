@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import json
+import inspect
 import datetime
 
 import requests
@@ -32,10 +33,11 @@ LOG_DIR = os.environ.get("LOG_DIR", "logs")
 # Observations across steps, so give later turns a generous ceiling.
 LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", "900"))
 # The 3B quantized model sometimes re-verifies information it already has
-# (re-fetching a summary, an unrequested PCA pass) before it actually
-# concludes, so one-shot CLI queries get a more generous default than the
-# library default of 8 used when run_agent_loop() is called directly.
-DEFAULT_MAX_ITERATIONS = int(os.environ.get("MAX_ITERATIONS", "8"))
+# (re-fetching a summary, an unrequested PCA pass) or blends two tools'
+# parameter names together before it actually concludes, so one-shot CLI
+# queries get a more generous default than the library default of 8 used
+# when run_agent_loop() is called directly.
+DEFAULT_MAX_ITERATIONS = int(os.environ.get("MAX_ITERATIONS", "10"))
 
 SYSTEM_PROMPT = """You are an expert Autonomous Machine Learning Assistant.
 You solve machine learning problems by thinking step-by-step and invoking external tools.
@@ -66,21 +68,42 @@ the same Action Input. Read the error message, reason about what went wrong, and
 tool with corrected parameters (e.g. a smaller learning rate, a valid model_type, or a valid
 n_components).
 
+Only call one of the 6 tools listed above -- never invent a tool name that is not in that list.
+
+Before calling a tool, check whether you already received an Observation that answers the exact
+same question (e.g. you already have the dataset summary, or you already trained that exact
+model). If you already have the information, do NOT call that tool again -- reuse the numbers
+you already have and move on to the next distinct step the task still needs.
+
 Do NOT write "Final Answer" until you have a real Observation for every tool call the task
 requires. Writing "Final Answer" and then continuing to write more Action/Action Input text is
 invalid and will be rejected -- if the task has multiple parts, finish gathering every
-Observation first, THEN write exactly one "Final Answer" and stop.
+Observation first, THEN write exactly one "Final Answer" and stop. As soon as you have every
+Observation the task needs, write the Final Answer immediately -- do not perform extra
+confirmatory or repeated tool calls "just to be sure".
 
 When you have received the observation(s) and are ready to give the complete answer to the user,
 format your output as:
 Thought: I have gathered all necessary experimental data.
 Final Answer: <your complete answer, including any requested tables or comparisons>
 
-Example of ONE correct turn (notice it stops right after Action Input -- it never writes
-"Observation:" itself and never fabricates a Final Answer before real data comes back):
+Example showing how you PROGRESS across turns (illustrative only -- this whole block, including
+its Observations, is just a demonstration of the pattern; it is not part of the real
+conversation, and the real Observation text will differ). Notice turn 1 stops right after its
+Action Input -- it never writes "Observation:" itself and never fabricates a Final Answer before
+real data comes back -- and notice turn 2 does NOT repeat turn 1's action, it moves on to a new
+tool now that it has the summary it needed:
+
 Thought: I need the shape and class balance of the wine dataset before choosing a model.
 Action: load_dataset_summary
 Action Input: {"dataset_name": "wine"}
+
+Observation: {"dataset": "wine", "n_samples": 178, "n_features": 13, "classes": ["0", "1", "2"], "missing_values": 0}
+
+Thought: I already have the dataset summary above -- calling it again would teach me nothing new.
+Now that I know the shape and class balance, I will train a model on it.
+Action: train_sklearn_model
+Action Input: {"dataset_name": "wine", "model_type": "random_forest"}
 
 Begin!
 """
@@ -105,8 +128,16 @@ def query_local_llm(prompt: str) -> str:
 
 def _next_log_path() -> str:
     os.makedirs(LOG_DIR, exist_ok=True)
-    existing = [f for f in os.listdir(LOG_DIR) if f.startswith("run_") and f.endswith(".log")]
-    return os.path.join(LOG_DIR, f"run_{len(existing) + 1:03d}.log")
+    # Use the highest existing run number + 1, not a plain count -- once any
+    # earlier run is archived out of LOG_DIR (e.g. into logs/_archive/), a
+    # count-based name would collide with/reuse an already-archived number.
+    existing_nums = [
+        int(m.group(1))
+        for f in os.listdir(LOG_DIR)
+        if (m := re.match(r"run_(\d+)\.log$", f))
+    ]
+    next_num = max(existing_nums, default=0) + 1
+    return os.path.join(LOG_DIR, f"run_{next_num:03d}.log")
 
 
 def run_agent_loop(user_query: str, max_iterations: int = 8) -> str:
@@ -129,14 +160,18 @@ def run_agent_loop(user_query: str, max_iterations: int = 8) -> str:
     final_answer = None
     # Repeat-call guard: as the prompt grows across steps, the small
     # quantized model can lose track of what it already did and re-issue
-    # the *identical* Action/Action Input turn after turn instead of
-    # progressing -- left unchecked this both wastes the iteration budget
-    # and keeps re-appending duplicate Observations, ballooning the prompt
-    # until Ollama's memory use gets the container OOM-killed. We track the
-    # last executed call and short-circuit an exact repeat with a nudge
-    # instead of re-running the tool, aborting outright after a few in a row.
-    last_call = None
-    repeat_count = 0
+    # an *identical* Action/Action Input instead of progressing -- not only
+    # back-to-back, but also several steps later after other tools ran in
+    # between (e.g. re-fetching a dataset summary it already has). Left
+    # unchecked this both wastes the iteration budget and keeps
+    # re-appending duplicate Observations, ballooning the prompt until
+    # Ollama's memory use gets the container OOM-killed. We remember every
+    # (tool, input) pair actually executed so far and short-circuit ANY
+    # repeat of one with a nudge instead of re-running the tool, aborting
+    # outright once nudging itself stalls out.
+    executed_calls = set()
+    used_tool_names = set()
+    consecutive_nudges = 0
 
     for step in range(1, max_iterations + 1):
         emit(f"\n--- Step {step} ---")
@@ -177,10 +212,13 @@ def run_agent_loop(user_query: str, max_iterations: int = 8) -> str:
         else:
             llm_output = raw_output
 
+        # Always show what the model actually produced in the log/console,
+        # even a detected duplicate -- but decide *below* whether it also
+        # gets appended to the working `prompt` that feeds the next turn.
         emit(llm_output)
-        prompt += llm_output
 
         if final_idx != -1 and not has_action:
+            prompt += llm_output
             emit("\n>>> Task Completed Successfully!")
             final_answer = llm_output.split("Final Answer:", 1)[1].strip()
             break
@@ -190,24 +228,37 @@ def run_agent_loop(user_query: str, max_iterations: int = 8) -> str:
             raw_input = input_match.group(1).strip()
 
             call_key = (tool_name, raw_input)
-            repeat_count = repeat_count + 1 if call_key == last_call else 0
-            last_call = call_key
 
-            if repeat_count >= 3:
-                emit("\n>>> Aborting: agent repeated the same Action Input 3 turns in a row "
-                     "without progressing.")
-                break
-
-            if repeat_count >= 1:
+            if call_key in executed_calls:
+                consecutive_nudges += 1
+                if consecutive_nudges >= 4:
+                    emit("\n>>> Aborting: agent kept repeating Action Inputs it already has "
+                         "results for, even after repeated nudges to move on.")
+                    break
+                # Critical: do NOT append this duplicate llm_output to
+                # `prompt`. Small quantized models fall into self-reinforcing
+                # repetition once an identical block appears twice in their
+                # own context -- feeding the duplicate back in (even
+                # alongside a nudge) was observed to make a 3rd, 4th, ... copy
+                # more likely rather than less. Only the nudge Observation is
+                # appended, so the model's own repeated text never accumulates
+                # in what it reads back next turn.
+                untried = [t for t in AVAILABLE_TOOLS if t not in used_tool_names]
+                untried_hint = f" Tools you have not used yet in this task: {untried}." if untried else ""
                 observation = (
-                    f"\nObservation: You already called {tool_name} with this exact input in "
-                    f"the previous step and already have that result. Do not repeat it -- use "
-                    f"what you already learned and move on to the next tool this task still "
-                    f"needs, or write your Final Answer if you have everything.\n"
+                    f"\nObservation: You already called {tool_name} with this exact input "
+                    f"earlier in this task and already have that result. Do not repeat it -- "
+                    f"use what you already learned instead.{untried_hint} Call one of those, or "
+                    f"write your Final Answer now if you already have everything the task needs.\n"
                 )
                 emit(observation)
                 prompt += observation
                 continue
+
+            prompt += llm_output
+            consecutive_nudges = 0
+            executed_calls.add(call_key)
+            used_tool_names.add(tool_name)
 
             try:
                 kwargs = json.loads(raw_input)
@@ -223,10 +274,25 @@ def run_agent_loop(user_query: str, max_iterations: int = 8) -> str:
                     observation = f"\nObservation: {tool_res}\n"
                 except Exception as e:
                     # Self-healing (Task 3): the LLM sees *what* failed and is
-                    # explicitly told to retry with corrected parameters.
+                    # explicitly told to retry with corrected parameters. A
+                    # bare exception message (e.g. "unexpected keyword
+                    # argument 'hidden_dim'") tells it a param name is wrong
+                    # but not what's actually valid -- the 3B model has been
+                    # observed blending two tools' parameter names together
+                    # (e.g. passing train_pytorch_mlp's hidden_dim/epochs
+                    # into train_sklearn_model). Echoing the tool's real
+                    # signature turns that into a self-correctable Observation
+                    # instead of a second guess.
+                    try:
+                        sig = str(inspect.signature(AVAILABLE_TOOLS[tool_name]))
+                    except (TypeError, ValueError):
+                        sig = ""
                     observation = (
                         f"\nObservation: Tool execution error: {str(e)}. "
-                        f"Reconsider your parameters and retry the same tool.\n"
+                        f"The actual signature of {tool_name} is {tool_name}{sig}. "
+                        f"Reconsider your parameters and retry -- either call {tool_name} again "
+                        f"with only its real parameters, or call a different tool if this one "
+                        f"isn't the right one for what you're trying to do.\n"
                     )
             else:
                 observation = (
@@ -237,6 +303,9 @@ def run_agent_loop(user_query: str, max_iterations: int = 8) -> str:
             emit(observation)
             prompt += observation
         else:
+            # Not a duplicate-action case -- this is genuine (if unhelpful)
+            # new content, so it belongs in the prompt like any other turn.
+            prompt += llm_output
             reminder = "\nObservation: Please respond with a Thought + Action + Action Input, or a Final Answer.\n"
             emit(reminder)
             prompt += reminder
