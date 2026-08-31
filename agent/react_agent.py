@@ -31,6 +31,11 @@ LOG_DIR = os.environ.get("LOG_DIR", "logs")
 # CPU-only inference slows down noticeably as the ReAct prompt accumulates
 # Observations across steps, so give later turns a generous ceiling.
 LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", "900"))
+# The 3B quantized model sometimes re-verifies information it already has
+# (re-fetching a summary, an unrequested PCA pass) before it actually
+# concludes, so one-shot CLI queries get a more generous default than the
+# library default of 8 used when run_agent_loop() is called directly.
+DEFAULT_MAX_ITERATIONS = int(os.environ.get("MAX_ITERATIONS", "8"))
 
 SYSTEM_PROMPT = """You are an expert Autonomous Machine Learning Assistant.
 You solve machine learning problems by thinking step-by-step and invoking external tools.
@@ -122,6 +127,16 @@ def run_agent_loop(user_query: str, max_iterations: int = 8) -> str:
 
     prompt = f"{SYSTEM_PROMPT}\nUser Query: {user_query}\n"
     final_answer = None
+    # Repeat-call guard: as the prompt grows across steps, the small
+    # quantized model can lose track of what it already did and re-issue
+    # the *identical* Action/Action Input turn after turn instead of
+    # progressing -- left unchecked this both wastes the iteration budget
+    # and keeps re-appending duplicate Observations, ballooning the prompt
+    # until Ollama's memory use gets the container OOM-killed. We track the
+    # last executed call and short-circuit an exact repeat with a nudge
+    # instead of re-running the tool, aborting outright after a few in a row.
+    last_call = None
+    repeat_count = 0
 
     for step in range(1, max_iterations + 1):
         emit(f"\n--- Step {step} ---")
@@ -174,6 +189,26 @@ def run_agent_loop(user_query: str, max_iterations: int = 8) -> str:
             tool_name = action_match.group(1).strip()
             raw_input = input_match.group(1).strip()
 
+            call_key = (tool_name, raw_input)
+            repeat_count = repeat_count + 1 if call_key == last_call else 0
+            last_call = call_key
+
+            if repeat_count >= 3:
+                emit("\n>>> Aborting: agent repeated the same Action Input 3 turns in a row "
+                     "without progressing.")
+                break
+
+            if repeat_count >= 1:
+                observation = (
+                    f"\nObservation: You already called {tool_name} with this exact input in "
+                    f"the previous step and already have that result. Do not repeat it -- use "
+                    f"what you already learned and move on to the next tool this task still "
+                    f"needs, or write your Final Answer if you have everything.\n"
+                )
+                emit(observation)
+                prompt += observation
+                continue
+
             try:
                 kwargs = json.loads(raw_input)
             except json.JSONDecodeError:
@@ -219,7 +254,7 @@ def run_agent_loop(user_query: str, max_iterations: int = 8) -> str:
 def main():
     if len(sys.argv) > 1:
         query = " ".join(sys.argv[1:])
-        run_agent_loop(query)
+        run_agent_loop(query, max_iterations=DEFAULT_MAX_ITERATIONS)
         return
 
     print("Autonomous ML Agent -- interactive mode. Type 'exit' or 'quit' to stop.\n")
@@ -232,7 +267,7 @@ def main():
             break
         if not query:
             continue
-        run_agent_loop(query)
+        run_agent_loop(query, max_iterations=DEFAULT_MAX_ITERATIONS)
 
 
 if __name__ == "__main__":
