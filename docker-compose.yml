@@ -1,0 +1,50 @@
+services:
+  # Local LLM inference engine (quantized model served over REST on :11434)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cse445_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # One-shot init container: pulls the model once, then exits successfully.
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: cse445_ollama_pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    command: ["pull", "${OLLAMA_MODEL:-llama3.2:3b}"]
+    restart: "no"
+
+  # Python ReAct agent (ml_tools.py / react_agent.py / benchmark_runner.py)
+  agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    container_name: cse445_agent
+    depends_on:
+      ollama-pull:
+        condition: service_completed_successfully
+    environment:
+      - OLLAMA_URL=http://ollama:11434/api/generate
+      - MODEL_NAME=${OLLAMA_MODEL:-llama3.2:3b}
+      - LOG_DIR=/app/logs
+    volumes:
+      - ./agent/logs:/app/logs
+    stdin_open: true
+    tty: true
+    command: ["python", "react_agent.py"]
+
+volumes:
+  ollama_data:
