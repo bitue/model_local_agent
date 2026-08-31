@@ -46,6 +46,9 @@ Task 3 benchmark (3 algorithms × 2 datasets, Markdown summary table):
 ```bash
 docker compose run --rm agent python benchmark_runner.py
 ```
+This runs 6 independent short ReAct sub-tasks (one per algorithm/dataset pair,
+each writing its own `run_NNN.log`) and assembles the Markdown table from
+their verified results — see "Benchmark design" below for why.
 
 Every run writes a full trace to `agent/logs/run_NNN.log` (or `benchmark_*.md`)
 on your host machine (mounted volume) — these are your execution-log deliverables.
@@ -106,6 +109,26 @@ tools not yet used **without** re-appending the duplicate text to the prompt
 (re-appending it was found to make the repetition worse, not better — see
 `REPORT.md` §3.1) — and aborts cleanly after a few repeated nudges rather than
 looping forever or ballooning the prompt.
+
+## Benchmark design: fabrication guard + decomposition
+
+`benchmark_runner.py` does not ask the agent to plan and execute all 6
+required calls in one long session -- that was tried first and proved
+unreliable (see `REPORT.md` §3.1/§6): the model would fabricate the numbers
+for calls it never made once a Final Answer looked "close enough," and even
+once that was blocked it would stall re-issuing calls it already had. Instead:
+
+- `run_agent_loop()` takes an optional `required_calls` list; it **rejects**
+  any Final Answer until every required call has a real, verified
+  Observation (matched by parameter subset, so an extra explicit default
+  parameter like `test_size=0.2` still counts) -- this is what actually
+  prevents fabricated numbers, not just a format check.
+- `benchmark_runner.py` runs 6 independent single-purpose sub-tasks (one per
+  algorithm/dataset pair) instead of one long session, each stopping the
+  instant its one required call succeeds (`stop_when_satisfied=True`). The
+  Markdown table is assembled in Python from these 6 verified results; the
+  LLM is asked only for the closing bias/variance commentary given the real,
+  complete table.
 
 ## Known limitation: local Ollama stability under sustained load
 
