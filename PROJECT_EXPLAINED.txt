@@ -1,0 +1,159 @@
+========================================================================
+WHAT THIS PROJECT IS — IN PLAIN ENGLISH
+========================================================================
+
+You built a robot assistant that solves Machine Learning problems by
+itself, using a small AI model that runs entirely on your own computer
+(no internet, no ChatGPT, no paid API).
+
+Think of it like this:
+
+    YOU ask a question
+         |
+         v
+    THE BRAIN (a small local AI model called llama3.2, run by a program
+    called Ollama) THINKS about what to do next
+         |
+         v
+    THE HANDS (a Python file called ml_tools.py) actually DOES the work
+    — loads a dataset, trains a model, tunes settings, etc.
+         |
+         v
+    THE BRAIN looks at the result and decides the NEXT step
+         |
+         v
+    ...this repeats until the brain says "I'm done, here's your answer"
+
+This loop (Think -> Act -> Observe -> Think again) is called a "ReAct
+agent". The controller script (react_agent.py) is the part that manages
+this loop — it asks the brain what to do, runs the actual tool, and
+feeds the real result back.
+
+
+========================================================================
+THE 3 MAIN PARTS OF THE PROJECT
+========================================================================
+
+1. ml_tools.py
+   The "toolbox". Contains 6 tools the AI can call:
+   - load_dataset_summary   -> tells you about a dataset (iris/wine/etc.)
+   - train_sklearn_model    -> trains a Decision Tree / Random Forest / etc.
+   - train_pytorch_mlp      -> trains a simple neural network
+   - tune_hyperparameters   -> auto-tunes model settings
+   - reduce_dimensionality  -> simplifies data (PCA)
+   - train_deep_classifier  -> trains a fancier neural network
+
+2. react_agent.py
+   The "controller" / "manager". Talks to the AI brain, reads what tool
+   it wants to use, runs that tool for real, and reports the real result
+   back so the AI can decide the next step. This is where almost all of
+   today's bug-fixing happened.
+
+3. benchmark_runner.py
+   Uses the agent to automatically test all 3 algorithms on 2 datasets
+   (6 combinations total) and builds a results table.
+
+
+========================================================================
+WHERE THE PROBLEMS WERE (in the order we found them)
+========================================================================
+
+The AI model you're using (llama3.2, a small 3-billion-parameter model)
+is fast and free, but it's not very "smart" compared to something like
+ChatGPT. It kept making the same handful of mistakes. Here they are,
+simplest first:
+
+--- PROBLEM 1: The AI made up fake results instead of doing the work ---
+Sometimes the AI would just WRITE what it thought the answer might look
+like, without actually calling a tool. It's like a student writing
+"the experiment showed 95% accuracy" without ever running the
+experiment.
+FIX: We made the controller smarter — if the AI says "I'm going to do
+X" and THEN writes a final answer without doing X, we throw away the
+fake final answer and force it to actually do X first.
+
+--- PROBLEM 2: The AI got stuck repeating itself ---
+The AI would call the same tool with the same input over and over
+(like a broken record), instead of moving to the next step. Example:
+it would ask "what does the wine dataset look like?" 5 times in a row.
+FIX (this took several tries to properly diagnose):
+  - First we tried: "if you repeat yourself, I'll remind you not to."
+    This helped a little but not fully.
+  - We tried making the AI's word choices more "random" to break the
+    loop — this backfired badly and made the AI produce garbage text.
+  - The REAL cause, which we eventually found by reading the raw data
+    sent to the AI: every time the AI repeated itself, the controller
+    was ALSO copying that repeated text back into what the AI reads
+    next — so the AI was staring at its own mistake twice, which made
+    it MORE likely to repeat it a third time, not less.
+  FIX: Stop copying the repeated mistake back in. Only give the AI a
+  short reminder message instead. This is the fix that actually worked.
+
+--- PROBLEM 3: The AI invented numbers for work it never did ---
+This was the most serious one. Once problem 2 was fixed, the AI got
+further along — but then, once it had gathered SOME real results, it
+would just invent believable-looking numbers for the rest instead of
+finishing the remaining work. Like a student who did 1 out of 6 homework
+questions, then just wrote plausible-looking answers for the other 5.
+FIX: We added a hard rule in the controller: "you are NOT allowed to
+give a final answer until I've personally verified that all 6 required
+pieces of work were actually done for real." If the AI tries to finish
+early, the controller rejects it and tells it exactly what's still
+missing.
+
+--- PROBLEM 4: Even without cheating, the AI couldn't reliably finish
+    a long list of 6 tasks in one sitting ---
+Even with cheating blocked, asking the small AI to do 6 things in a row
+in one long conversation was unreliable — it would do 1-5 correctly,
+then get confused and stall.
+FIX: Instead of asking it to do all 6 in one long conversation, we broke
+it into 6 SEPARATE short conversations — one per task. The small AI is
+very reliable at doing ONE thing when asked directly; it just struggles
+to track a long list. Then we glue the 6 real results together into the
+final table ourselves (in code), so the table's numbers are always
+100% real, and we only ask the AI to write the short summary/opinion
+paragraph at the end (a much easier job).
+
+--- PROBLEM 5: The computer running the AI kept crashing ---
+A few times, the local AI server itself (Ollama) crashed mid-task —
+nothing to do with the code, just the AI using too much of your
+computer's memory/CPU during a long run.
+FIX: No code fix possible for this — just restart it
+(`docker compose up -d ollama`) and try again. Documented as a known
+limitation in the report, since it's an honest real-world side effect
+of running AI locally instead of using a paid cloud service.
+
+
+========================================================================
+THE BIG LESSON FROM ALL THIS
+========================================================================
+
+A small, free, local AI model is NOT as reliable as a big cloud AI. It
+will:
+  - occasionally lie/make things up if not double-checked,
+  - occasionally get stuck repeating itself,
+  - struggle with long multi-step tasks.
+
+The fix for all of this was NOT "write a better instruction for the
+AI" (we tried that first, it wasn't enough). The real fix was building
+a stricter CONTROLLER around the AI that:
+  - never fully trusts the AI's word,
+  - double-checks that real work was actually done before accepting
+    an answer,
+  - and breaks big jobs into small, easy, verifiable pieces.
+
+This is actually a good, realistic lesson for the report: it shows you
+understand that autonomous AI agents need guardrails, not just good
+prompts.
+
+
+========================================================================
+CURRENT STATUS
+========================================================================
+
+- All 3 grading tasks (Task 1, 2, 3) now have real, verified proof —
+  no fake numbers anywhere.
+- The technical report (REPORT.md) is filled in with real results.
+- Only 2 things left for YOU to do:
+    1. Write your name + Student ID at the top of REPORT.md
+    2. Push this project to your own GitHub repo and submit the link
