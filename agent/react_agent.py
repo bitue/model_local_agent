@@ -18,6 +18,7 @@ Environment variables (set automatically by docker-compose.yml):
 import os
 import re
 import sys
+import time
 import json
 import inspect
 import datetime
@@ -118,6 +119,14 @@ def query_local_llm(prompt: str) -> str:
         "options": {
             "temperature": 0.1,
             "stop": ["Observation:"],
+            # Bound a single turn's generation. Without this the model can
+            # ramble on unbounded once it drifts off the strict Thought/
+            # Action format (observed producing 200+ token free-form
+            # responses on this host, which twice coincided with the local
+            # Ollama server itself crashing under CPU/memory pressure mid-
+            # generation) -- one real turn never legitimately needs more
+            # than a few hundred tokens.
+            "num_predict": 400,
         },
     }
     response = requests.post(OLLAMA_URL, json=payload, timeout=LLM_TIMEOUT_SECONDS)
@@ -175,6 +184,11 @@ def run_agent_loop(user_query: str, max_iterations: int = 8) -> str:
 
     for step in range(1, max_iterations + 1):
         emit(f"\n--- Step {step} ---")
+        # Real per-turn LLM latency, for the technical report's latency
+        # benchmark section -- CPU-only inference slows down as the prompt
+        # accumulates Observations across steps, so this is worth capturing
+        # turn-by-turn rather than just once for the whole run.
+        turn_started = time.monotonic()
         try:
             raw_output = query_local_llm(prompt)
         except requests.exceptions.RequestException as e:
@@ -187,6 +201,8 @@ def run_agent_loop(user_query: str, max_iterations: int = 8) -> str:
             except requests.exceptions.RequestException as e2:
                 emit(f"\n>>> LLM request failed again ({e2}); aborting this run.")
                 break
+        llm_latency = time.monotonic() - turn_started
+        emit(f"[LLM latency: {llm_latency:.2f}s, prompt length: {len(prompt)} chars]")
 
         action_match = re.search(r"Action:\s*([a-zA-Z0-9_]+)", raw_output)
         input_match = re.search(r"Action Input:\s*(\{.*?\})", raw_output, re.DOTALL)

@@ -89,13 +89,39 @@ model_local_agent/
 
 `react_agent.py` catches every tool exception and every explicit `{"error": ...}`
 payload (bad dataset/model name, invalid `n_components`, NaN loss, etc.) and
-feeds it back to the LLM as an `Observation` that names the problem and hints
-at a valid fix, instead of a bare stack trace — so the next turn is a genuine
-corrected retry, not a repeat of the same failing call.
+feeds it back to the LLM as an `Observation` that names the problem, echoes the
+tool's real parameter signature, and hints at a valid fix, instead of a bare
+stack trace — so the next turn is a genuine corrected retry, not a repeat of
+the same failing call. See `agent/logs/run_011.log` (steps 5-6) for a captured
+proof trace: a `tune_hyperparameters` call with an invalid `model_type` is
+rejected, and the very next Thought explicitly reasons about the error before
+retrying with a valid one.
+
+## Repeat-loop guard
+
+The 3B quantized model occasionally re-issues an identical `Action`/`Action
+Input` instead of progressing. `react_agent.py` tracks every `(tool, input)`
+pair actually executed and, on a repeat, nudges the model with a list of
+tools not yet used **without** re-appending the duplicate text to the prompt
+(re-appending it was found to make the repetition worse, not better — see
+`REPORT.md` §3.1) — and aborts cleanly after a few repeated nudges rather than
+looping forever or ballooning the prompt.
+
+## Known limitation: local Ollama stability under sustained load
+
+On resource-constrained hosts (e.g. a Docker Desktop WSL2 VM with ~8 GB
+allocated), the `ollama` container has been observed to crash under sustained
+CPU-only inference during long multi-step runs. If a run aborts with
+`Connection refused`, run `docker compose up -d ollama` to restart it, confirm
+`docker compose exec ollama ollama list` still shows the model, then re-run
+the agent command. This is an infrastructure/resource limit of local
+inference, not an agent logic bug — see `REPORT.md` §3.2.
 
 ## Notes for the technical report
 
 - Model/prompt config lives in `react_agent.py` (`SYSTEM_PROMPT`, `MODEL_NAME`, `OLLAMA_URL`).
-- Latency: timestamps are written at the start of every `logs/run_*.log`; time
-  between steps in the same log gives you per-turn LLM latency for the report.
-- Architecture diagram: see `step.md` §2 for the base diagram to extend.
+- Latency: every turn now prints and logs `[LLM latency: X.XXs, prompt length:
+  N chars]`, so per-turn LLM latency for the report can be read directly out
+  of any `logs/run_*.log` without recomputing it from timestamps.
+- Architecture diagram: see `step.md` §2 for the base diagram to extend, or
+  `REPORT.md` §2 for the expanded version already used in the report.
